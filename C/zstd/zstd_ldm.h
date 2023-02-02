@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2021, Yann Collet, Facebook, Inc.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
  *
  * This source code is licensed under both the BSD-style license (found in the
@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 #include "zstd_compress_internal.h"   /* ldmParams_t, U32 */
-#include "zstd.h"   /* ZSTD_CCtx, size_t */
+#include "../zstd.h"   /* ZSTD_CCtx, size_t */
 
 /*-*************************************
 *  Long distance matching
@@ -66,6 +66,7 @@ size_t ZSTD_ldm_generateSequences(
  */
 size_t ZSTD_ldm_blockCompress(rawSeqStore_t* rawSeqStore,
             ZSTD_matchState_t* ms, seqStore_t* seqStore, U32 rep[ZSTD_REP_NUM],
+            ZSTD_paramSwitch_e useRowMatchFinder,
             void const* src, size_t srcSize);
 
 /**

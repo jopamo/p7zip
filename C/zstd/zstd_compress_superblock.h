@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2021, Yann Collet, Facebook, Inc.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
  *
  * This source code is licensed under both the BSD-style license (found in the
@@ -15,7 +15,7 @@
 *  Dependencies
 ***************************************/
 
-#include "zstd.h" /* ZSTD_CCtx */
+#include "../zstd.h" /* ZSTD_CCtx */
 
 /*-*************************************
 *  Target Compressed Block Size

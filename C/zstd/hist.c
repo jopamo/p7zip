@@ -1,7 +1,7 @@
 /* ******************************************************************
  * hist : Histogram functions
  * part of Finite State Entropy project
- * Copyright (c) 2013-2021, Yann Collet, Facebook, Inc.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  *  You can contact the author at :
  *  - FSE source repository : https://github.com/Cyan4973/FiniteStateEntropy
@@ -14,9 +14,9 @@
 ****************************************************************** */
 
 /* --- dependencies --- */
-#include "mem.h"             /* U32, BYTE, etc. */
-#include "debug.h"           /* assert, DEBUGLOG */
-#include "error_private.h"   /* ERROR */
+#include "../common/mem.h"             /* U32, BYTE, etc. */
+#include "../common/debug.h"           /* assert, DEBUGLOG */
+#include "../common/error_private.h"   /* ERROR */
 #include "hist.h"
 
 
