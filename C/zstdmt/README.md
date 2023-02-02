@@ -1,48 +1,77 @@
 
-# Multithreading Library for [Brotli], [Lizard], [LZ4], [LZ5] and [Zstandard]
+# Usage
 
-## Description
-- works with skippables frame id 0x184D2A50 (12 bytes per compressed frame)
-- brotli is supported the same way, it will encapsulate the real brotli stream
-  within an 16 byte frame header
+## Compression
 
-## Generic skippable frame definition
+```
+typedef struct {
+	void *buf;		/* ptr to data */
+	size_t size;		/* current filled in buf */
+	size_t allocated;	/* length of buf */
+} ZSTDMT_Buffer;
 
-- the frame header for [Lizard], [LZ4], [LZ5] and [Zstandard] is like this:
+/**
+ * defining wrapper functions for read/write
+ * - you can use stdio functions
+ * - you can also use read(2) / write(2) on unix
+ * - a sample is given in 7-Zip ZS MT
+ *
+ * valid return values for the wrapper function
+ *  0 - no error, success (all was written or read)
+ * -1 - generic read or write error
+ * -2 - cancel request by user
+ * -3 - out of memory
+ */
 
-size    | value             | description
---------|-------------------|------------
-4 bytes | 0x184D2A50U       | magic for skippable frame
-4 bytes | 4                 | size of skippable frame
-4 bytes | compressed size   | size of the following frame (compressed data)
+/**
+ * fn_read() - read some input
+ */
+typedef int (fn_read) (void *args, ZSTDMT_Buffer * in);
 
+/**
+ * fn_write() - write some output
+ */
+typedef int (fn_write) (void *args, ZSTDMT_Buffer * out);
 
-## [Brotli] frame definition
+typedef struct {
+	fn_read *fn_read;
+	void *arg_read;
+	fn_write *fn_write;
+	void *arg_write;
+} ZSTDMT_RdWr_t;
 
-- the frame header for brotli is defined a bit different:
+typedef struct ZSTDMT_CCtx_s ZSTDMT_CCtx;
 
-size    | value             | description
---------|-------------------|------------
-4 bytes | 0x184D2A50U       | magic for skippable frame (like zstd)
-4 bytes | 8                 | size of skippable frame
-4 bytes | compressed size   | size of the following frame (compressed data)
-2 bytes | 0x5242U           | magic for brotli "BR"
-2 bytes | uncompressed size | allocation hint for decompressor (64KB * this size)
+/* 1) allocate new cctx */
+ZSTDMT_CCtx *ZSTDMT_createCCtx(int threads, int level, int inputsize);
 
+/* 2) threaded compression */
+size_t ZSTDMT_compressCCtx(ZSTDMT_CCtx * ctx, ZSTDMT_RdWr_t * rdwr);
 
-## Usage of the Testutils
-- see [programs](https://github.com/mcmilk/zstdmt/tree/master/programs)
+/* 3) get some statistic */
+size_t ZSTDMT_GetFramesCCtx(ZSTDMT_CCtx * ctx);
+size_t ZSTDMT_GetInsizeCCtx(ZSTDMT_CCtx * ctx);
+size_t ZSTDMT_GetOutsizeCCtx(ZSTDMT_CCtx * ctx);
 
-## Usage of the Library
+/* 4) free cctx */
+void ZSTDMT_freeCCtx(ZSTDMT_CCtx * ctx);
+```
 
-- see [lib](https://github.com/mcmilk/zstdmt/tree/master/lib)
+## Decompression
+```
+typedef struct ZSTDMT_DCtx_s ZSTDMT_DCtx;
 
+/* 1) allocate new cctx */
+ZSTDMT_DCtx *ZSTDMT_createDCtx(int threads, int inputsize);
 
-[Brotli]:https://github.com/google/brotli/
-[LZ4]:https://github.com/lz4/lz4/
-[LZ5]:https://github.com/inikep/lz5/
-[Zstandard]:https://github.com/facebook/zstd/
-[Lizard]:https://github.com/inikep/lizard/
+/* 2) threaded decompression */
+size_t ZSTDMT_decompressDCtx(ZSTDMT_DCtx * ctx, ZSTDMT_RdWr_t * rdwr);
 
+/* 3) get some statistic */
+size_t ZSTDMT_GetFramesDCtx(ZSTDMT_DCtx * ctx);
+size_t ZSTDMT_GetInsizeDCtx(ZSTDMT_DCtx * ctx);
+size_t ZSTDMT_GetOutsizeDCtx(ZSTDMT_DCtx * ctx);
 
-/TR 2017-05-24
+/* 4) free cctx */
+void ZSTDMT_freeDCtx(ZSTDMT_DCtx * ctx);
+```

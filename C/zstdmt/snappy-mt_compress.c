@@ -1,29 +1,18 @@
-
-/**
- * Copyright (c) 2016 - 2017 Tino Reichardt
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
- *
- * You can contact the author at:
- * - zstdmt source repository: https://github.com/mcmilk/zstdmt
- */
-
-#include <stdlib.h>
-#include <string.h>
-
-#define LZ5F_DISABLE_OBSOLETE_ENUMS
-#include "lz5frame.h"
+#include "snappy.h"
+#include "snappy-mt.h"
 
 #include "memmt.h"
 #include "threading.h"
 #include "list.h"
-#include "lz5-mt.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define SNAPPY_IN_ALLOC_SIZE (1024*64)
 
 /**
- * multi threaded lz5 - multiple workers version
+ * multi threaded snappy - multiple workers version
  *
  * - each thread works on his own
  * - no main thread which does reading and then starting the work
@@ -35,26 +24,25 @@
  *   4) begin with step 1 again, until no input
  */
 
-/* worker for compression */
 typedef struct {
-	LZ5MT_CCtx *ctx;
-	LZ5F_preferences_t zpref;
+	SNAPPYMT_CCtx *ctx;
+	struct snappy_env zpref;
 	pthread_t pthread;
 } cwork_t;
 
-struct writelist;
 struct writelist {
 	size_t frame;
-	LZ5MT_Buffer out;
+	SNAPPYMT_Buffer out;
 	struct list_head node;
 };
 
-struct LZ5MT_CCtx_s {
 
-	/* level: 1..22 */
+struct SNAPPYMT_CCtx_s {
+
+	/* levels: 1..SNAPPYMT NOT USE  DELETE level maybe later*/
 	int level;
 
-	/* threads: 1..LZ5MT_THREAD_MAX */
+	/* threads: 1..SNAPPYMT_THREAD_MAX */
 	int threads;
 
 	/* should be used for read from input */
@@ -71,12 +59,12 @@ struct LZ5MT_CCtx_s {
 
 	/* reading input */
 	pthread_mutex_t read_mutex;
-	fn_read *fn_read;
+	fnRead *fn_read;
 	void *arg_read;
 
 	/* writing output */
 	pthread_mutex_t write_mutex;
-	fn_write *fn_write;
+	fnWrite *fn_write;
 	void *arg_write;
 
 	/* lists for writing queue */
@@ -89,32 +77,32 @@ struct LZ5MT_CCtx_s {
  * Compression
  ****************************************/
 
-LZ5MT_CCtx *LZ5MT_createCCtx(int threads, int level, int inputsize)
+SNAPPYMT_CCtx *SNAPPYMT_createCCtx(int threads, __attribute__((unused)) int level,/*Not use*/ 
+								   int inputsize)
 {
-	LZ5MT_CCtx *ctx;
+	SNAPPYMT_CCtx *ctx;
 	int t;
 
 	/* allocate ctx */
-	ctx = (LZ5MT_CCtx *) malloc(sizeof(LZ5MT_CCtx));
+	ctx = (SNAPPYMT_CCtx *) malloc(sizeof(SNAPPYMT_CCtx));
 	if (!ctx)
 		return 0;
 
 	/* check threads value */
-	if (threads < 1 || threads > LZ5MT_THREAD_MAX)
+	if (threads < 1 || threads > SNAPPYMT_THREAD_MAX)
 		return 0;
 
 	/* check level */
-	if (level < LZ5MT_LEVEL_MIN || level > LZ5MT_LEVEL_MAX)
-		return 0;
+	/* None level */
 
 	/* calculate chunksize for one thread */
 	if (inputsize)
 		ctx->inputsize = inputsize;
 	else
-		ctx->inputsize = 1024 * 1024 * 4;
+		ctx->inputsize = SNAPPY_IN_ALLOC_SIZE;  /* 64K frame */
 
 	/* setup ctx */
-	ctx->level = level;
+	ctx->level = 0; 
 	ctx->threads = threads;
 	ctx->insize = 0;
 	ctx->outsize = 0;
@@ -137,14 +125,6 @@ LZ5MT_CCtx *LZ5MT_createCCtx(int threads, int level, int inputsize)
 		cwork_t *w = &ctx->cwork[t];
 		w->ctx = ctx;
 
-		/* setup preferences for that thread */
-		memset(&w->zpref, 0, sizeof(LZ5F_preferences_t));
-		w->zpref.compressionLevel = level;
-		w->zpref.frameInfo.blockMode = LZ5F_blockLinked;
-		w->zpref.frameInfo.contentSize = 1;
-		w->zpref.frameInfo.contentChecksumFlag =
-		    LZ5F_contentChecksumEnabled;
-
 	}
 
 	return ctx;
@@ -152,30 +132,30 @@ LZ5MT_CCtx *LZ5MT_createCCtx(int threads, int level, int inputsize)
  err_cwork:
 	free(ctx);
 
-	return 0;
+	return NULL;
 }
 
 /**
- * mt_error - return mt lib specific error code
+ * mt_error - return mt lib specific error code read write ERROR
  */
 static size_t mt_error(int rv)
 {
 	switch (rv) {
 	case -1:
-		return ERROR(read_fail);
+		return MT_ERROR(read_fail);
 	case -2:
-		return ERROR(canceled);
+		return MT_ERROR(canceled);
 	case -3:
-		return ERROR(memory_allocation);
+		return MT_ERROR(memory_allocation);
 	}
 
-	return ERROR(read_fail);
+	return MT_ERROR(read_fail);
 }
 
 /**
  * pt_write - queue for compressed output
  */
-static size_t pt_write(LZ5MT_CCtx * ctx, struct writelist *wl)
+static size_t pt_write(SNAPPYMT_CCtx *ctx, struct writelist *wl)
 {
 	struct list_head *entry;
 
@@ -207,15 +187,15 @@ static size_t pt_write(LZ5MT_CCtx * ctx, struct writelist *wl)
 static void *pt_compress(void *arg)
 {
 	cwork_t *w = (cwork_t *) arg;
-	LZ5MT_CCtx *ctx = w->ctx;
+	SNAPPYMT_CCtx *ctx = w->ctx;
 	size_t result;
-	LZ5MT_Buffer in;
+	SNAPPYMT_Buffer in;
 
 	/* inbuf is constant */
 	in.size = ctx->inputsize;
 	in.buf = malloc(in.size);
 	if (!in.buf)
-		return (void *)ERROR(memory_allocation);
+		return (void *)MT_ERROR(memory_allocation);
 
 	for (;;) {
 		struct list_head *entry;
@@ -229,8 +209,7 @@ static void *pt_compress(void *arg)
 			entry = list_first(&ctx->writelist_free);
 			wl = list_entry(entry, struct writelist, node);
 			wl->out.size =
-			    LZ5F_compressFrameBound(ctx->inputsize,
-						    &w->zpref) + 12;
+			    snappy_max_compressed_length((size_t)(ctx->inputsize)) + 16;
 			list_move(entry, &ctx->writelist_busy);
 		} else {
 			/* allocate new one */
@@ -238,15 +217,14 @@ static void *pt_compress(void *arg)
 			    malloc(sizeof(struct writelist));
 			if (!wl) {
 				pthread_mutex_unlock(&ctx->write_mutex);
-				return (void *)ERROR(memory_allocation);
+				return (void *)MT_ERROR(memory_allocation);
 			}
 			wl->out.size =
-			    LZ5F_compressFrameBound(ctx->inputsize,
-						    &w->zpref) + 12;;
+			    snappy_max_compressed_length((size_t)(ctx->inputsize)) + 16;
 			wl->out.buf = malloc(wl->out.size);
 			if (!wl->out.buf) {
 				pthread_mutex_unlock(&ctx->write_mutex);
-				return (void *)ERROR(memory_allocation);
+				return (void *)MT_ERROR(memory_allocation);
 			}
 			list_add(&wl->node, &ctx->writelist_busy);
 		}
@@ -277,31 +255,56 @@ static void *pt_compress(void *arg)
 		pthread_mutex_unlock(&ctx->read_mutex);
 
 		/* compress whole frame */
-		result =
-		    LZ5F_compressFrame((unsigned char *)wl->out.buf + 12,
-				       wl->out.size - 12, in.buf, in.size,
-				       &w->zpref);
-		if (LZ5F_isError(result)) {
-			pthread_mutex_lock(&ctx->write_mutex);
-			list_move(&wl->node, &ctx->writelist_free);
-			pthread_mutex_unlock(&ctx->write_mutex);
-			/* user can lookup that code */
-			lz5mt_errcode = result;
-			return (void *)ERROR(compression_library);
+		{
+			const char *ibuf = (char *)(in.buf);
+			char *obuf = (char *)(wl->out.buf) + 16;
+			wl->out.size -= 16;
+
+
+			struct snappy_env env;
+			snappy_init_env(&env);
+			rv = snappy_compress(&(env), ibuf, in.size, obuf, &wl->out.size);
+
+			/* printf("snappy_compress() rv=%d in=%zu out=%zu\n", rv, in.size, wl->out.size); */
+
+			if (rv != SNAPPY_OK) {
+				pthread_mutex_lock(&ctx->write_mutex);
+				list_move(&wl->node, &ctx->writelist_free);
+				pthread_mutex_unlock(&ctx->write_mutex);
+				return (void *)MT_ERROR(frame_compress);
+			}
+			snappy_free_env(&(env));
 		}
 
 		/* write skippable frame */
 		MEM_writeLE32((unsigned char *)wl->out.buf + 0,
-			      LZ5FMT_MAGIC_SKIPPABLE);
-		MEM_writeLE32((unsigned char *)wl->out.buf + 4, 4);
-		MEM_writeLE32((unsigned char *)wl->out.buf + 8, (U32) result);
-		wl->out.size = result + 12;
+			      SNAPPYMT_MAGIC_SKIPPABLE);
+		MEM_writeLE32((unsigned char *)wl->out.buf + 4, 8);
+		MEM_writeLE32((unsigned char *)wl->out.buf + 8,
+			      (U32) wl->out.size);
+		/* BR */
+		MEM_writeLE16((unsigned char *)wl->out.buf + 12,
+			      (U16) SNAPPYMT_MAGICNUMBER);
+
+		/* number of 64KB blocks needed for decompression */
+		{
+		U16 hintsize;
+		if (ctx->inputsize > (int)in.size) {
+			hintsize = (U16)(in.size >> 16);
+			hintsize += 1;
+		} else
+			hintsize = ctx->inputsize >> 16;
+		MEM_writeLE16((unsigned char *)wl->out.buf + 14,
+			      hintsize);
+		}
+
+		wl->out.size += 16;
 
 		/* write result */
 		pthread_mutex_lock(&ctx->write_mutex);
 		result = pt_write(ctx, wl);
 		pthread_mutex_unlock(&ctx->write_mutex);
-		if (LZ5MT_isError(result))
+		if (SNAPPYMT_isError(result))
 			return (void *)result;
 	}
 
@@ -309,13 +312,13 @@ static void *pt_compress(void *arg)
 	return 0;
 }
 
-size_t LZ5MT_compressCCtx(LZ5MT_CCtx * ctx, LZ5MT_RdWr_t * rdwr)
+size_t SNAPPYMT_compressCCtx(SNAPPYMT_CCtx *ctx, SNAPPYMT_RdWr_t *rdwr)
 {
 	int t;
 	void *retval_of_thread = 0;
 
 	if (!ctx)
-		return ERROR(compressionParameter_unsupported);
+		return MT_ERROR(compressionParameter_unsupported);
 
 	/* init reading and writing functions */
 	ctx->fn_read = rdwr->fn_read;
@@ -353,7 +356,7 @@ size_t LZ5MT_compressCCtx(LZ5MT_CCtx * ctx, LZ5MT_RdWr_t * rdwr)
 }
 
 /* returns current uncompressed data size */
-size_t LZ5MT_GetInsizeCCtx(LZ5MT_CCtx * ctx)
+size_t SNAPPYMT_GetInsizeCCtx(SNAPPYMT_CCtx * ctx)
 {
 	if (!ctx)
 		return 0;
@@ -362,7 +365,7 @@ size_t LZ5MT_GetInsizeCCtx(LZ5MT_CCtx * ctx)
 }
 
 /* returns the current compressed data size */
-size_t LZ5MT_GetOutsizeCCtx(LZ5MT_CCtx * ctx)
+size_t SNAPPYMT_GetOutsizeCCtx(SNAPPYMT_CCtx * ctx)
 {
 	if (!ctx)
 		return 0;
@@ -371,7 +374,7 @@ size_t LZ5MT_GetOutsizeCCtx(LZ5MT_CCtx * ctx)
 }
 
 /* returns the current compressed frames */
-size_t LZ5MT_GetFramesCCtx(LZ5MT_CCtx * ctx)
+size_t SNAPPYMT_GetFramesCCtx(SNAPPYMT_CCtx * ctx)
 {
 	if (!ctx)
 		return 0;
@@ -379,7 +382,7 @@ size_t LZ5MT_GetFramesCCtx(LZ5MT_CCtx * ctx)
 	return ctx->curframe;
 }
 
-void LZ5MT_freeCCtx(LZ5MT_CCtx * ctx)
+void SNAPPYMT_freeCCtx(SNAPPYMT_CCtx * ctx)
 {
 	if (!ctx)
 		return;
@@ -392,3 +395,63 @@ void LZ5MT_freeCCtx(LZ5MT_CCtx * ctx)
 
 	return;
 }
+
+// /* API example */
+// static int ReadData(void *arg, SNAPPYMT_Buffer * in)
+// {
+// 	FILE *fd = (FILE *) arg;
+// 	size_t done = fread(in->buf, 1, in->size, fd);
+// 	in->size = done;
+
+// 	return 0;
+// }
+
+// static int WriteData(void *arg, SNAPPYMT_Buffer * out)
+// {
+// 	FILE *fd = (FILE *) arg;
+// 	ssize_t done = fwrite(out->buf, 1, out->size, fd);
+// 	out->size = done;
+	
+// 	return 0;
+// }
+
+
+// int main(int argc, char *argv[]){
+
+//     FILE *fin, *fout;
+//     fin = fopen(argv[1], "r");
+//     if(!fin){
+//         std::cout << "fin open faild!" << std::endl;
+//     }
+//     fout = fopen(argv[2], "wb");
+//     if(!fout){
+//         std::cout << "fout open faild!" << std::endl;
+//     }
+
+// 	SNAPPYMT_RdWr_t rdwr;
+// 	/* 1) setup read/write functions */
+// 	rdwr.fn_read = ReadData;
+// 	rdwr.fn_write = WriteData;
+// 	rdwr.arg_read = (void *)fin;
+// 	rdwr.arg_write = (void *)fout;
+
+// 	SNAPPYMT_CCtx *cctx = SNAPPYMT_createCCtx(2, 0);
+// 	if (!cctx){
+// 		std::cout << "Allocating compression context failed!" << std::endl;
+// 		return -1;
+// 	}
+
+// 	size_t ret = SNAPPYMT_compressCCtx(cctx, &rdwr);
+// 	if (SNAPPYMT_isError(ret)){
+// 		std::cout << SNAPPYMT_getErrorString(ret) << std::endl;
+// 		return -1;
+// 	}
+
+// 	SNAPPYMT_freeCCtx(cctx);
+
+//     fclose(fin);
+//     fclose(fout);
+
+
+//     return 0;
+// }

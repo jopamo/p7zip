@@ -14,7 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../brotli/encode.h"
+#include "brotli/encode.h"
 
 #include "brotli-mt.h"
 #include "memmt.h"
@@ -48,8 +48,6 @@ struct writelist {
 };
 
 struct BROTLIMT_CCtx_s {
-
-	/* levels: 1..BROTLIMT_LEVEL_MAX */
 	int level;
 
 	/* threads: 1..BROTLIMT_THREAD_MAX */

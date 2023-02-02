@@ -1,29 +1,18 @@
-
-/**
- * Copyright (c) 2016 - 2017 Tino Reichardt
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
- *
- * You can contact the author at:
- * - zstdmt source repository: https://github.com/mcmilk/zstdmt
- */
-
-#include <stdlib.h>
-#include <string.h>
-
-#define LZ5F_DISABLE_OBSOLETE_ENUMS
-#include "lz5frame.h"
+#include "lzfse.h"
+#include "lzfse-mt.h"
 
 #include "memmt.h"
 #include "threading.h"
 #include "list.h"
-#include "lz5-mt.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define LZFSE_IN_ALLOC_SIZE (1 << 16)
 
 /**
- * multi threaded lz5 - multiple workers version
+ * multi threaded lzfse - multiple workers version
  *
  * - each thread works on his own
  * - no main thread which does reading and then starting the work
@@ -35,26 +24,24 @@
  *   4) begin with step 1 again, until no input
  */
 
-/* worker for compression */
 typedef struct {
-	LZ5MT_CCtx *ctx;
-	LZ5F_preferences_t zpref;
+	LZFSEMT_CCtx *ctx;
 	pthread_t pthread;
 } cwork_t;
 
-struct writelist;
 struct writelist {
 	size_t frame;
-	LZ5MT_Buffer out;
+	LZFSEMT_Buffer out;
 	struct list_head node;
 };
 
-struct LZ5MT_CCtx_s {
 
-	/* level: 1..22 */
+struct LZFSEMT_CCtx_s {
+
+	/* levels: 1..LZFSEMT NOT USE  DELETE level maybe later*/
 	int level;
 
-	/* threads: 1..LZ5MT_THREAD_MAX */
+	/* threads: 1..LZFSEMT_THREAD_MAX */
 	int threads;
 
 	/* should be used for read from input */
@@ -71,12 +58,12 @@ struct LZ5MT_CCtx_s {
 
 	/* reading input */
 	pthread_mutex_t read_mutex;
-	fn_read *fn_read;
+	fnRead *fn_read;
 	void *arg_read;
 
 	/* writing output */
 	pthread_mutex_t write_mutex;
-	fn_write *fn_write;
+	fnWrite *fn_write;
 	void *arg_write;
 
 	/* lists for writing queue */
@@ -89,32 +76,32 @@ struct LZ5MT_CCtx_s {
  * Compression
  ****************************************/
 
-LZ5MT_CCtx *LZ5MT_createCCtx(int threads, int level, int inputsize)
+LZFSEMT_CCtx *LZFSEMT_createCCtx(int threads, __attribute__((unused)) int level,/*Not use*/ 
+								   int inputsize)
 {
-	LZ5MT_CCtx *ctx;
+	LZFSEMT_CCtx *ctx;
 	int t;
 
 	/* allocate ctx */
-	ctx = (LZ5MT_CCtx *) malloc(sizeof(LZ5MT_CCtx));
+	ctx = (LZFSEMT_CCtx *) malloc(sizeof(LZFSEMT_CCtx));
 	if (!ctx)
 		return 0;
 
 	/* check threads value */
-	if (threads < 1 || threads > LZ5MT_THREAD_MAX)
+	if (threads < 1 || threads > LZFSEMT_THREAD_MAX)
 		return 0;
 
 	/* check level */
-	if (level < LZ5MT_LEVEL_MIN || level > LZ5MT_LEVEL_MAX)
-		return 0;
+	/* None level */
 
 	/* calculate chunksize for one thread */
 	if (inputsize)
 		ctx->inputsize = inputsize;
 	else
-		ctx->inputsize = 1024 * 1024 * 4;
+		ctx->inputsize = LZFSE_IN_ALLOC_SIZE;  /* 64K frame */
 
 	/* setup ctx */
-	ctx->level = level;
+	ctx->level = 0; 
 	ctx->threads = threads;
 	ctx->insize = 0;
 	ctx->outsize = 0;
@@ -137,14 +124,6 @@ LZ5MT_CCtx *LZ5MT_createCCtx(int threads, int level, int inputsize)
 		cwork_t *w = &ctx->cwork[t];
 		w->ctx = ctx;
 
-		/* setup preferences for that thread */
-		memset(&w->zpref, 0, sizeof(LZ5F_preferences_t));
-		w->zpref.compressionLevel = level;
-		w->zpref.frameInfo.blockMode = LZ5F_blockLinked;
-		w->zpref.frameInfo.contentSize = 1;
-		w->zpref.frameInfo.contentChecksumFlag =
-		    LZ5F_contentChecksumEnabled;
-
 	}
 
 	return ctx;
@@ -152,30 +131,30 @@ LZ5MT_CCtx *LZ5MT_createCCtx(int threads, int level, int inputsize)
  err_cwork:
 	free(ctx);
 
-	return 0;
+	return NULL;
 }
 
 /**
- * mt_error - return mt lib specific error code
+ * mt_error - return mt lib specific error code read write ERROR
  */
 static size_t mt_error(int rv)
 {
 	switch (rv) {
 	case -1:
-		return ERROR(read_fail);
+		return MT_ERROR(read_fail);
 	case -2:
-		return ERROR(canceled);
+		return MT_ERROR(canceled);
 	case -3:
-		return ERROR(memory_allocation);
+		return MT_ERROR(memory_allocation);
 	}
 
-	return ERROR(read_fail);
+	return MT_ERROR(read_fail);
 }
 
 /**
  * pt_write - queue for compressed output
  */
-static size_t pt_write(LZ5MT_CCtx * ctx, struct writelist *wl)
+static size_t pt_write(LZFSEMT_CCtx *ctx, struct writelist *wl)
 {
 	struct list_head *entry;
 
@@ -207,15 +186,15 @@ static size_t pt_write(LZ5MT_CCtx * ctx, struct writelist *wl)
 static void *pt_compress(void *arg)
 {
 	cwork_t *w = (cwork_t *) arg;
-	LZ5MT_CCtx *ctx = w->ctx;
+	LZFSEMT_CCtx *ctx = w->ctx;
 	size_t result;
-	LZ5MT_Buffer in;
+	LZFSEMT_Buffer in;
 
 	/* inbuf is constant */
 	in.size = ctx->inputsize;
 	in.buf = malloc(in.size);
 	if (!in.buf)
-		return (void *)ERROR(memory_allocation);
+		return (void *)MT_ERROR(memory_allocation);
 
 	for (;;) {
 		struct list_head *entry;
@@ -228,9 +207,7 @@ static void *pt_compress(void *arg)
 			/* take unused entry */
 			entry = list_first(&ctx->writelist_free);
 			wl = list_entry(entry, struct writelist, node);
-			wl->out.size =
-			    LZ5F_compressFrameBound(ctx->inputsize,
-						    &w->zpref) + 12;
+			wl->out.size = ctx->inputsize + 16;
 			list_move(entry, &ctx->writelist_busy);
 		} else {
 			/* allocate new one */
@@ -238,15 +215,13 @@ static void *pt_compress(void *arg)
 			    malloc(sizeof(struct writelist));
 			if (!wl) {
 				pthread_mutex_unlock(&ctx->write_mutex);
-				return (void *)ERROR(memory_allocation);
+				return (void *)MT_ERROR(memory_allocation);
 			}
-			wl->out.size =
-			    LZ5F_compressFrameBound(ctx->inputsize,
-						    &w->zpref) + 12;;
+			wl->out.size = ctx->inputsize + 16;
 			wl->out.buf = malloc(wl->out.size);
 			if (!wl->out.buf) {
 				pthread_mutex_unlock(&ctx->write_mutex);
-				return (void *)ERROR(memory_allocation);
+				return (void *)MT_ERROR(memory_allocation);
 			}
 			list_add(&wl->node, &ctx->writelist_busy);
 		}
@@ -277,31 +252,57 @@ static void *pt_compress(void *arg)
 		pthread_mutex_unlock(&ctx->read_mutex);
 
 		/* compress whole frame */
-		result =
-		    LZ5F_compressFrame((unsigned char *)wl->out.buf + 12,
-				       wl->out.size - 12, in.buf, in.size,
-				       &w->zpref);
-		if (LZ5F_isError(result)) {
-			pthread_mutex_lock(&ctx->write_mutex);
-			list_move(&wl->node, &ctx->writelist_free);
-			pthread_mutex_unlock(&ctx->write_mutex);
-			/* user can lookup that code */
-			lz5mt_errcode = result;
-			return (void *)ERROR(compression_library);
+		while (1) {
+			const char *ibuf = (char *)(in.buf);
+			char *obuf = (char *)(wl->out.buf) + 16;
+			wl->out.size -= 16;
+
+			rv = lzfse_encode_buffer((uint8_t *)obuf, wl->out.size, (uint8_t *)ibuf, in.size, NULL);
+
+			if (rv == 0) {
+				wl->out.size <<= 1;
+				wl->out.size += 16;
+				wl->out.buf = (uint8_t *)realloc(wl->out.buf, wl->out.size);
+				if (wl->out.buf == 0) {
+					pthread_mutex_lock(&ctx->write_mutex);
+					list_move(&wl->node, &ctx->writelist_free);
+					pthread_mutex_unlock(&ctx->write_mutex);
+					return (void *)MT_ERROR(frame_compress);
+				}
+				continue;
+			}
+			wl->out.size = rv;
+			break;
 		}
 
 		/* write skippable frame */
 		MEM_writeLE32((unsigned char *)wl->out.buf + 0,
-			      LZ5FMT_MAGIC_SKIPPABLE);
-		MEM_writeLE32((unsigned char *)wl->out.buf + 4, 4);
-		MEM_writeLE32((unsigned char *)wl->out.buf + 8, (U32) result);
-		wl->out.size = result + 12;
+			      LZFSEMT_MAGIC_SKIPPABLE);
+		MEM_writeLE32((unsigned char *)wl->out.buf + 4, 8);
+		MEM_writeLE32((unsigned char *)wl->out.buf + 8,
+			      (U32) wl->out.size);
+		/* BR */
+		MEM_writeLE16((unsigned char *)wl->out.buf + 12,
+			      (U16) LZFSEMT_MAGICNUMBER);
+
+		/* number of 64KB blocks needed for decompression */
+		{
+		U16 hintsize;
+		if (ctx->inputsize > (int)in.size) { // size of readed data less than block size
+			hintsize = (U16)(in.size >> 16);
+			hintsize += 1;
+		} else
+			hintsize = ctx->inputsize >> 16; // size of readed data equal to block size, never greater than
+			MEM_writeLE16((unsigned char *)wl->out.buf + 14, hintsize);
+		}
+
+		wl->out.size += 16;
 
 		/* write result */
 		pthread_mutex_lock(&ctx->write_mutex);
 		result = pt_write(ctx, wl);
 		pthread_mutex_unlock(&ctx->write_mutex);
-		if (LZ5MT_isError(result))
+		if (LZFSEMT_isError(result))
 			return (void *)result;
 	}
 
@@ -309,13 +310,13 @@ static void *pt_compress(void *arg)
 	return 0;
 }
 
-size_t LZ5MT_compressCCtx(LZ5MT_CCtx * ctx, LZ5MT_RdWr_t * rdwr)
+size_t LZFSEMT_compressCCtx(LZFSEMT_CCtx *ctx, LZFSEMT_RdWr_t *rdwr)
 {
 	int t;
 	void *retval_of_thread = 0;
 
 	if (!ctx)
-		return ERROR(compressionParameter_unsupported);
+		return MT_ERROR(compressionParameter_unsupported);
 
 	/* init reading and writing functions */
 	ctx->fn_read = rdwr->fn_read;
@@ -353,7 +354,7 @@ size_t LZ5MT_compressCCtx(LZ5MT_CCtx * ctx, LZ5MT_RdWr_t * rdwr)
 }
 
 /* returns current uncompressed data size */
-size_t LZ5MT_GetInsizeCCtx(LZ5MT_CCtx * ctx)
+size_t LZFSEMT_GetInsizeCCtx(LZFSEMT_CCtx * ctx)
 {
 	if (!ctx)
 		return 0;
@@ -362,7 +363,7 @@ size_t LZ5MT_GetInsizeCCtx(LZ5MT_CCtx * ctx)
 }
 
 /* returns the current compressed data size */
-size_t LZ5MT_GetOutsizeCCtx(LZ5MT_CCtx * ctx)
+size_t LZFSEMT_GetOutsizeCCtx(LZFSEMT_CCtx * ctx)
 {
 	if (!ctx)
 		return 0;
@@ -371,7 +372,7 @@ size_t LZ5MT_GetOutsizeCCtx(LZ5MT_CCtx * ctx)
 }
 
 /* returns the current compressed frames */
-size_t LZ5MT_GetFramesCCtx(LZ5MT_CCtx * ctx)
+size_t LZFSEMT_GetFramesCCtx(LZFSEMT_CCtx * ctx)
 {
 	if (!ctx)
 		return 0;
@@ -379,7 +380,7 @@ size_t LZ5MT_GetFramesCCtx(LZ5MT_CCtx * ctx)
 	return ctx->curframe;
 }
 
-void LZ5MT_freeCCtx(LZ5MT_CCtx * ctx)
+void LZFSEMT_freeCCtx(LZFSEMT_CCtx * ctx)
 {
 	if (!ctx)
 		return;

@@ -15,7 +15,7 @@
 #include <string.h>
 
 #define LizardF_DISABLE_OBSOLETE_ENUMS
-#include "../lizard/lizard_frame.h"
+#include "lizard_frame.h"
 
 #include "memmt.h"
 #include "threading.h"
@@ -51,7 +51,7 @@ struct writelist {
 
 struct LIZARDMT_CCtx_s {
 
-	/* level: 1..LIZARDMT_LEVEL_MAX */
+	/* level: 1..22 */
 	int level;
 
 	/* threads: 1..LIZARDMT_THREAD_MAX */

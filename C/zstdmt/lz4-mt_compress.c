@@ -15,7 +15,7 @@
 #include <string.h>
 
 #define LZ4F_DISABLE_OBSOLETE_ENUMS
-#include "../lz4/lz4frame.h"
+#include "lz4frame.h"
 
 #include "memmt.h"
 #include "threading.h"
@@ -111,7 +111,7 @@ LZ4MT_CCtx *LZ4MT_createCCtx(int threads, int level, int inputsize)
 	if (inputsize)
 		ctx->inputsize = inputsize;
 	else
-		ctx->inputsize = 1024 * 1024;//1024 * 64;
+		ctx->inputsize = 1024 * 1024 * 4;
 
 	/* setup ctx */
 	ctx->level = level;
@@ -291,13 +291,11 @@ static void *pt_compress(void *arg)
 		}
 
 		/* write skippable frame */
-		if (ctx->threads > 1) {
-			MEM_writeLE32((unsigned char *)wl->out.buf + 0,
-				      LZ4FMT_MAGIC_SKIPPABLE);
-			MEM_writeLE32((unsigned char *)wl->out.buf + 4, 4);
-			MEM_writeLE32((unsigned char *)wl->out.buf + 8, (U32) result);
-			wl->out.size = result + 12;
-		}
+		MEM_writeLE32((unsigned char *)wl->out.buf + 0,
+			      LZ4FMT_MAGIC_SKIPPABLE);
+		MEM_writeLE32((unsigned char *)wl->out.buf + 4, 4);
+		MEM_writeLE32((unsigned char *)wl->out.buf + 8, (U32) result);
+		wl->out.size = result + 12;
 
 		/* write result */
 		pthread_mutex_lock(&ctx->write_mutex);

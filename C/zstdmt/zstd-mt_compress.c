@@ -11,24 +11,23 @@
  * - zstdmt source repository: https://github.com/mcmilk/zstdmt
  */
 
+#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
-#define LZ5F_DISABLE_OBSOLETE_ENUMS
-#include "lz5frame.h"
+#define ZSTD_STATIC_LINKING_ONLY
+#include "zstd.h"
 
 #include "memmt.h"
 #include "threading.h"
 #include "list.h"
-#include "lz5-mt.h"
+#include "zstd-mt.h"
 
 /**
- * multi threaded lz5 - multiple workers version
+ * multi threaded zstd compression
  *
  * - each thread works on his own
- * - no main thread which does reading and then starting the work
  * - needs a callback for reading / writing
- * - each worker does his:
+ * - each worker does this:
  *   1) get read mutex and read some input
  *   2) release read mutex and do compression
  *   3) get write mutex and write result
@@ -37,27 +36,26 @@
 
 /* worker for compression */
 typedef struct {
-	LZ5MT_CCtx *ctx;
-	LZ5F_preferences_t zpref;
+	ZSTDCB_CCtx *ctx;
 	pthread_t pthread;
 } cwork_t;
 
 struct writelist;
 struct writelist {
 	size_t frame;
-	LZ5MT_Buffer out;
+	ZSTDCB_Buffer out;
 	struct list_head node;
 };
 
-struct LZ5MT_CCtx_s {
+struct ZSTDCB_CCtx_s {
 
-	/* level: 1..22 */
+	/* level: 1..ZSTDCB_LEVEL_MAX */
 	int level;
 
-	/* threads: 1..LZ5MT_THREAD_MAX */
+	/* threads: 1..ZSTDCB_THREAD_MAX */
 	int threads;
 
-	/* should be used for read from input */
+	/* buffersize for reading input */
 	int inputsize;
 
 	/* statistic */
@@ -79,6 +77,10 @@ struct LZ5MT_CCtx_s {
 	fn_write *fn_write;
 	void *arg_write;
 
+	/* error handling */
+	pthread_mutex_t error_mutex;
+	size_t zstdmt_errcode;
+
 	/* lists for writing queue */
 	struct list_head writelist_free;
 	struct list_head writelist_busy;
@@ -89,69 +91,66 @@ struct LZ5MT_CCtx_s {
  * Compression
  ****************************************/
 
-LZ5MT_CCtx *LZ5MT_createCCtx(int threads, int level, int inputsize)
+ZSTDCB_CCtx *ZSTDCB_createCCtx(int threads, int level, int inputsize)
 {
-	LZ5MT_CCtx *ctx;
+	ZSTDCB_CCtx *ctx;
 	int t;
 
 	/* allocate ctx */
-	ctx = (LZ5MT_CCtx *) malloc(sizeof(LZ5MT_CCtx));
+	ctx = (ZSTDCB_CCtx *) malloc(sizeof(ZSTDCB_CCtx));
 	if (!ctx)
 		return 0;
 
 	/* check threads value */
-	if (threads < 1 || threads > LZ5MT_THREAD_MAX)
-		return 0;
+	if (threads < 1 || threads > ZSTDCB_THREAD_MAX)
+		goto err_ctx;
 
 	/* check level */
-	if (level < LZ5MT_LEVEL_MIN || level > LZ5MT_LEVEL_MAX)
-		return 0;
+	if (level < ZSTDCB_LEVEL_MIN || level > ZSTDCB_LEVEL_MAX)
+		goto err_ctx;
+
+
+
 
 	/* calculate chunksize for one thread */
 	if (inputsize)
 		ctx->inputsize = inputsize;
-	else
-		ctx->inputsize = 1024 * 1024 * 4;
+	else {
+		const int windowLog[] = {
+			19, 19, 20, 20, 20, /*  1 -  5 */
+			21, 21, 21, 21, 21, /*  6 - 10 */
+			22, 22, 22, 22, 22, /* 11 - 15 */
+			23, 23, 23, 23, 25, /* 16 - 20 */
+			26, 27
+		};
+		ctx->inputsize = 1 << (windowLog[level - 1] + 1);
+	}
 
 	/* setup ctx */
 	ctx->level = level;
 	ctx->threads = threads;
-	ctx->insize = 0;
-	ctx->outsize = 0;
-	ctx->frames = 0;
-	ctx->curframe = 0;
 
 	pthread_mutex_init(&ctx->read_mutex, NULL);
 	pthread_mutex_init(&ctx->write_mutex, NULL);
+	pthread_mutex_init(&ctx->error_mutex, NULL);
 
-	/* free -> busy -> out -> free -> ... */
-	INIT_LIST_HEAD(&ctx->writelist_free);	/* free, can be used */
-	INIT_LIST_HEAD(&ctx->writelist_busy);	/* busy */
-	INIT_LIST_HEAD(&ctx->writelist_done);	/* can be written */
+	INIT_LIST_HEAD(&ctx->writelist_free);
+	INIT_LIST_HEAD(&ctx->writelist_busy);
+	INIT_LIST_HEAD(&ctx->writelist_done);
 
 	ctx->cwork = (cwork_t *) malloc(sizeof(cwork_t) * threads);
 	if (!ctx->cwork)
-		goto err_cwork;
+		goto err_ctx;
 
-	for (t = 0; t < threads; t++) {
+	for (t = 0; t < ctx->threads; t++) {
 		cwork_t *w = &ctx->cwork[t];
 		w->ctx = ctx;
-
-		/* setup preferences for that thread */
-		memset(&w->zpref, 0, sizeof(LZ5F_preferences_t));
-		w->zpref.compressionLevel = level;
-		w->zpref.frameInfo.blockMode = LZ5F_blockLinked;
-		w->zpref.frameInfo.contentSize = 1;
-		w->zpref.frameInfo.contentChecksumFlag =
-		    LZ5F_contentChecksumEnabled;
-
 	}
 
 	return ctx;
 
- err_cwork:
+ err_ctx:
 	free(ctx);
-
 	return 0;
 }
 
@@ -162,22 +161,23 @@ static size_t mt_error(int rv)
 {
 	switch (rv) {
 	case -1:
-		return ERROR(read_fail);
+		return ZSTDCB_ERROR(read_fail);
 	case -2:
-		return ERROR(canceled);
+		return ZSTDCB_ERROR(canceled);
 	case -3:
-		return ERROR(memory_allocation);
+		return ZSTDCB_ERROR(memory_allocation);
 	}
 
-	return ERROR(read_fail);
+	return ZSTDCB_ERROR(read_fail);
 }
 
 /**
  * pt_write - queue for compressed output
  */
-static size_t pt_write(LZ5MT_CCtx * ctx, struct writelist *wl)
+static size_t pt_write(ZSTDCB_CCtx * ctx, struct writelist *wl)
 {
 	struct list_head *entry;
+	int rv;
 
 	/* move the entry to the done list */
 	list_move(&wl->node, &ctx->writelist_done);
@@ -191,7 +191,7 @@ static size_t pt_write(LZ5MT_CCtx * ctx, struct writelist *wl)
 	list_for_each(entry, &ctx->writelist_done) {
 		wl = list_entry(entry, struct writelist, node);
 		if (wl->frame == ctx->curframe) {
-			int rv = ctx->fn_write(ctx->arg_write, &wl->out);
+			rv = ctx->fn_write(ctx->arg_write, &wl->out);
 			if (rv != 0)
 				return mt_error(rv);
 			ctx->outsize += wl->out.size;
@@ -204,22 +204,24 @@ static size_t pt_write(LZ5MT_CCtx * ctx, struct writelist *wl)
 	return 0;
 }
 
+/* parallel compression worker */
 static void *pt_compress(void *arg)
 {
 	cwork_t *w = (cwork_t *) arg;
-	LZ5MT_CCtx *ctx = w->ctx;
+	ZSTDCB_CCtx *ctx = w->ctx;
+	struct writelist *wl;
 	size_t result;
-	LZ5MT_Buffer in;
+	ZSTDCB_Buffer in;
 
 	/* inbuf is constant */
 	in.size = ctx->inputsize;
 	in.buf = malloc(in.size);
 	if (!in.buf)
-		return (void *)ERROR(memory_allocation);
+		return (void *)ZSTDCB_ERROR(memory_allocation);
 
 	for (;;) {
 		struct list_head *entry;
-		struct writelist *wl;
+		ZSTDCB_Buffer *out;
 		int rv;
 
 		/* allocate space for new output */
@@ -228,9 +230,7 @@ static void *pt_compress(void *arg)
 			/* take unused entry */
 			entry = list_first(&ctx->writelist_free);
 			wl = list_entry(entry, struct writelist, node);
-			wl->out.size =
-			    LZ5F_compressFrameBound(ctx->inputsize,
-						    &w->zpref) + 12;
+			wl->out.size = ZSTD_compressBound(ctx->inputsize) + 12;
 			list_move(entry, &ctx->writelist_busy);
 		} else {
 			/* allocate new one */
@@ -238,19 +238,20 @@ static void *pt_compress(void *arg)
 			    malloc(sizeof(struct writelist));
 			if (!wl) {
 				pthread_mutex_unlock(&ctx->write_mutex);
-				return (void *)ERROR(memory_allocation);
+				free(in.buf);
+				return (void *)ZSTDCB_ERROR(memory_allocation);
 			}
-			wl->out.size =
-			    LZ5F_compressFrameBound(ctx->inputsize,
-						    &w->zpref) + 12;;
+			wl->out.size = ZSTD_compressBound(ctx->inputsize) + 12;;
 			wl->out.buf = malloc(wl->out.size);
 			if (!wl->out.buf) {
 				pthread_mutex_unlock(&ctx->write_mutex);
-				return (void *)ERROR(memory_allocation);
+				free(in.buf);
+				return (void *)ZSTDCB_ERROR(memory_allocation);
 			}
 			list_add(&wl->node, &ctx->writelist_busy);
 		}
 		pthread_mutex_unlock(&ctx->write_mutex);
+		out = &wl->out;
 
 		/* read new input */
 		pthread_mutex_lock(&ctx->read_mutex);
@@ -258,7 +259,8 @@ static void *pt_compress(void *arg)
 		rv = ctx->fn_read(ctx->arg_read, &in);
 		if (rv != 0) {
 			pthread_mutex_unlock(&ctx->read_mutex);
-			return (void *)mt_error(rv);
+			result = mt_error(rv);
+			goto error;
 		}
 
 		/* eof */
@@ -277,51 +279,66 @@ static void *pt_compress(void *arg)
 		pthread_mutex_unlock(&ctx->read_mutex);
 
 		/* compress whole frame */
-		result =
-		    LZ5F_compressFrame((unsigned char *)wl->out.buf + 12,
-				       wl->out.size - 12, in.buf, in.size,
-				       &w->zpref);
-		if (LZ5F_isError(result)) {
-			pthread_mutex_lock(&ctx->write_mutex);
-			list_move(&wl->node, &ctx->writelist_free);
-			pthread_mutex_unlock(&ctx->write_mutex);
-			/* user can lookup that code */
-			lz5mt_errcode = result;
-			return (void *)ERROR(compression_library);
+		{
+			unsigned char *outbuf = out->buf;
+			result =
+			    ZSTD_compress(outbuf + 12, out->size - 12, in.buf,
+					  in.size, ctx->level);
+			if (ZSTD_isError(result)) {
+				zstdmt_errcode = result;
+				result = ZSTDCB_ERROR(compression_library);
+				goto error;
+			}
 		}
 
 		/* write skippable frame */
-		MEM_writeLE32((unsigned char *)wl->out.buf + 0,
-			      LZ5FMT_MAGIC_SKIPPABLE);
-		MEM_writeLE32((unsigned char *)wl->out.buf + 4, 4);
-		MEM_writeLE32((unsigned char *)wl->out.buf + 8, (U32) result);
-		wl->out.size = result + 12;
+		{
+			unsigned char *outbuf = out->buf;
+
+			MEM_writeLE32(outbuf + 0, ZSTDCB_MAGIC_SKIPPABLE);
+			MEM_writeLE32(outbuf + 4, 4);
+			MEM_writeLE32(outbuf + 8, (U32) result);
+			out->size = result + 12;
+		}
 
 		/* write result */
 		pthread_mutex_lock(&ctx->write_mutex);
 		result = pt_write(ctx, wl);
 		pthread_mutex_unlock(&ctx->write_mutex);
-		if (LZ5MT_isError(result))
-			return (void *)result;
+		if (ZSTDCB_isError(result))
+			goto error;
 	}
 
  okay:
 	return 0;
+ error:
+	pthread_mutex_lock(&ctx->write_mutex);
+	list_move(&wl->node, &ctx->writelist_free);
+	pthread_mutex_unlock(&ctx->write_mutex);
+	return (void *)result;
 }
 
-size_t LZ5MT_compressCCtx(LZ5MT_CCtx * ctx, LZ5MT_RdWr_t * rdwr)
+/* compress data, until input ends */
+size_t ZSTDCB_compressCCtx(ZSTDCB_CCtx * ctx, ZSTDCB_RdWr_t * rdwr)
 {
 	int t;
 	void *retval_of_thread = 0;
 
 	if (!ctx)
-		return ERROR(compressionParameter_unsupported);
+		return ZSTDCB_ERROR(init_missing);
 
-	/* init reading and writing functions */
+	/* setup reading and writing functions */
 	ctx->fn_read = rdwr->fn_read;
 	ctx->fn_write = rdwr->fn_write;
 	ctx->arg_read = rdwr->arg_read;
 	ctx->arg_write = rdwr->arg_write;
+
+	/* init counter and error codes */
+	ctx->insize = 0;
+	ctx->outsize = 0;
+	ctx->frames = 0;
+	ctx->curframe = 0;
+	ctx->zstdmt_errcode = 0;
 
 	/* start all workers */
 	for (t = 0; t < ctx->threads; t++) {
@@ -338,7 +355,7 @@ size_t LZ5MT_compressCCtx(LZ5MT_CCtx * ctx, LZ5MT_RdWr_t * rdwr)
 			retval_of_thread = p;
 	}
 
-	/* clean up lists */
+	/* clean up the free list */
 	while (!list_empty(&ctx->writelist_free)) {
 		struct writelist *wl;
 		struct list_head *entry;
@@ -349,43 +366,67 @@ size_t LZ5MT_compressCCtx(LZ5MT_CCtx * ctx, LZ5MT_RdWr_t * rdwr)
 		free(wl);
 	}
 
+	/* on error, these two lists may have some entries */
+	if (retval_of_thread) {
+		struct writelist *wl;
+		struct list_head *entry;
+
+		while (!list_empty(&ctx->writelist_busy)) {
+			entry = list_first(&ctx->writelist_busy);
+			wl = list_entry(entry, struct writelist, node);
+			free(wl->out.buf);
+			list_del(&wl->node);
+			free(wl);
+		}
+
+		while (!list_empty(&ctx->writelist_done)) {
+			entry = list_first(&ctx->writelist_done);
+			wl = list_entry(entry, struct writelist, node);
+			free(wl->out.buf);
+			list_del(&wl->node);
+			free(wl);
+		}
+	}
+
 	return (size_t) retval_of_thread;
 }
 
 /* returns current uncompressed data size */
-size_t LZ5MT_GetInsizeCCtx(LZ5MT_CCtx * ctx)
+size_t ZSTDCB_GetInsizeCCtx(ZSTDCB_CCtx * ctx)
 {
 	if (!ctx)
-		return 0;
+		return ZSTDCB_ERROR(init_missing);
 
+	/* no mutex needed here */
 	return ctx->insize;
 }
 
 /* returns the current compressed data size */
-size_t LZ5MT_GetOutsizeCCtx(LZ5MT_CCtx * ctx)
+size_t ZSTDCB_GetOutsizeCCtx(ZSTDCB_CCtx * ctx)
 {
 	if (!ctx)
-		return 0;
+		return ZSTDCB_ERROR(init_missing);
 
+	/* no mutex needed here */
 	return ctx->outsize;
 }
 
-/* returns the current compressed frames */
-size_t LZ5MT_GetFramesCCtx(LZ5MT_CCtx * ctx)
+/* returns the current compressed data frame count */
+size_t ZSTDCB_GetFramesCCtx(ZSTDCB_CCtx * ctx)
 {
 	if (!ctx)
-		return 0;
+		return ZSTDCB_ERROR(init_missing);
 
+	/* no mutex needed here */
 	return ctx->curframe;
 }
 
-void LZ5MT_freeCCtx(LZ5MT_CCtx * ctx)
+/* free all allocated buffers and structures */
+void ZSTDCB_freeCCtx(ZSTDCB_CCtx * ctx)
 {
 	if (!ctx)
 		return;
 
-	pthread_mutex_destroy(&ctx->read_mutex);
-	pthread_mutex_destroy(&ctx->write_mutex);
 	free(ctx->cwork);
 	free(ctx);
 	ctx = 0;
